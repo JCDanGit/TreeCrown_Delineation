@@ -1,0 +1,135 @@
+#ohne Löcher, mit Verbindung zu Inseln
+import os
+import numpy as np
+from osgeo import gdal, ogr, osr
+from scipy.ndimage import binary_dilation
+
+def png_to_shapefile_gdal(png_path, shp_path, threshold=150):
+    try:
+        # Bild öffnen
+        dataset = gdal.Open(png_path)
+        if dataset is None:
+            print(f"Fehler: Datei konnte nicht geöffnet werden: {png_path}")
+            return
+
+        if dataset.RasterCount < 3:
+            print(f"Warnung: Datei hat weniger als 3 Bänder: {png_path}")
+            return
+
+        red = dataset.GetRasterBand(1).ReadAsArray()
+        green = dataset.GetRasterBand(2).ReadAsArray()
+        blue = dataset.GetRasterBand(3).ReadAsArray()
+
+        # Maske: Pixel, die NICHT weiß sind
+        mask = ((red < threshold) | (green < threshold) | (blue < threshold)).astype(np.uint8)
+
+        # Morphologische Operation: "Dilation" mit einem 3x3-Kern => schließt 1-Pixel-Lücken
+        mask = binary_dilation(mask, structure=np.ones((3, 3))).astype(np.uint8)
+
+        # Ziel-Koordinatensystem (EPSG:3395 – World Mercator)
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(3395)
+        projection = srs.ExportToWkt()
+
+        # Raster mit Maske in Memory schreiben
+        driver = gdal.GetDriverByName("MEM")
+        mem_raster = driver.Create("", dataset.RasterXSize, dataset.RasterYSize, 1, gdal.GDT_Byte)
+        mem_raster.SetGeoTransform(dataset.GetGeoTransform())
+        mem_raster.SetProjection(projection)
+        mem_raster.GetRasterBand(1).WriteArray(mask)
+        mem_raster.GetRasterBand(1).SetNoDataValue(0)
+
+        # Shapefile vorbereiten
+        drv = ogr.GetDriverByName("ESRI Shapefile")
+        if os.path.exists(shp_path):
+            drv.DeleteDataSource(shp_path)
+        shp_ds = drv.CreateDataSource(shp_path)
+        layer = shp_ds.CreateLayer("structure", srs=srs, geom_type=ogr.wkbPolygon)
+
+        field_def = ogr.FieldDefn("id", ogr.OFTInteger)
+        layer.CreateField(field_def)
+
+        # Polygonisieren
+        gdal.Polygonize(mem_raster.GetRasterBand(1), None, layer, 0, [], callback=None)
+
+        # Hintergrund (id = 0) entfernen
+        layer.SetAttributeFilter("id = 0")
+        for feature in layer:
+            layer.DeleteFeature(feature.GetFID())
+        layer.SetAttributeFilter(None)
+
+        # Alle Geometrien sammeln
+        layer.ResetReading()
+        geometries = []
+        for feature in layer:
+            geom = feature.GetGeometryRef()
+            if geom is not None:
+                geometries.append(geom.Clone())
+
+        if not geometries:
+            print("Keine gültigen Strukturen gefunden.")
+            return
+
+        # Vereinige alle Geometrien
+        union_geom = geometries[0]
+        for g in geometries[1:]:
+            union_geom = union_geom.Union(g)
+
+        # Entferne Löcher und spiegle y-Koordinaten
+        def remove_holes_and_flip_y(geom):
+            geom_type = geom.GetGeometryType()
+            if geom_type == ogr.wkbPolygon:
+                outer_ring = geom.GetGeometryRef(0)
+                new_outer = ogr.Geometry(ogr.wkbLinearRing)
+                for i in range(outer_ring.GetPointCount()):
+                    x, y, z = outer_ring.GetPoint(i)
+                    new_outer.AddPoint(x, -y)
+                new_poly = ogr.Geometry(ogr.wkbPolygon)
+                new_poly.AddGeometry(new_outer)
+                return new_poly
+            elif geom_type == ogr.wkbMultiPolygon:
+                new_multi = ogr.Geometry(ogr.wkbMultiPolygon)
+                for i in range(geom.GetGeometryCount()):
+                    poly = geom.GetGeometryRef(i)
+                    cleaned = remove_holes_and_flip_y(poly)
+                    new_multi.AddGeometry(cleaned)
+                return new_multi
+            return None
+
+        cleaned_union = remove_holes_and_flip_y(union_geom)
+
+        # Layer leeren
+        layer.ResetReading()
+        for feature in layer:
+            layer.DeleteFeature(feature.GetFID())
+
+        # Neues Feature schreiben
+        out_feature = ogr.Feature(layer.GetLayerDefn())
+        out_feature.SetField("id", 1)
+        out_feature.SetGeometry(cleaned_union)
+        layer.CreateFeature(out_feature)
+
+        # Cleanup
+        shp_ds.Destroy()
+        print(f"Shapefile gespeichert mit 1-Pixel-Verbindung, ohne Löcher: {shp_path}")
+
+    except Exception as e:
+        print(f"Fehler bei Verarbeitung von {png_path}: {e}")
+
+# Eingabe- und Ausgabeordner
+input_root = r"Type\In\Filepath"
+output_root = r"Type\In\Filepath"
+os.makedirs(output_root, exist_ok=True)
+
+# Process all subfolders (Bild0, Bild1, ...)
+for folder in os.listdir(input_root):
+    input_folder = os.path.join(input_root, folder)
+    output_folder = os.path.join(output_root, f"Shapefile_{folder.split('Bild')[-1]}")
+    os.makedirs(output_folder, exist_ok=True)
+
+    # Process each PNG in the folder
+    for file in os.listdir(input_folder):
+        if file.lower().endswith(".png"):
+            in_path = os.path.join(input_folder, file)
+            out_path = os.path.join(output_folder, os.path.splitext(file)[0] + ".shp")
+            png_to_shapefile_gdal(in_path, out_path)
